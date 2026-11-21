@@ -41,6 +41,7 @@ from .models import (
     HealthOut,
     MinutesDayIn,
     PageOut,
+    QueryAuditOut,
     QueryCreatedOut,
     QueryDayOut,
     QueryIn,
@@ -71,6 +72,13 @@ Conn = Annotated[sqlite3.Connection, Depends(_conn)]
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db(db_path())
+    # Queries frozen by an older release get their bin verdicts settled now:
+    # once a day is corrected, the revision they adopted is gone for good.
+    conn = db.connect(db_path())
+    try:
+        service.audit_pending_queries(conn)
+    finally:
+        conn.close()
     yield
 
 
@@ -204,8 +212,19 @@ def list_days(start_date: date, end_date: date, conn: Conn) -> DayListOut:
         "Discards every candidate edge that would split a non-empty original "
         "band on any stored bins-day in range, reporting each such day and "
         "band. Counts are then frozen per day under the surviving edges; "
-        "readings equal to an edge go to the higher band."
+        "readings equal to an edge go to the higher band. If any stored day "
+        "in range has bins that are not contiguous and non-overlapping, the "
+        "request is refused with 409 ``anomalous_day_bins`` (listing each "
+        "date and its revision) and no snapshot is written."
     ),
+    responses={
+        409: {
+            "description": (
+                "A stored bins-day in range has anomalous original bins; no "
+                "query was created. The list names each date and revision."
+            )
+        }
+    },
 )
 def create_query(body: QueryIn, conn: Conn) -> QueryCreatedOut:
     result = service.create_query(
@@ -239,6 +258,25 @@ def get_page(
     query_id: str, page_no: Annotated[int, PathParam(ge=1)], conn: Conn
 ) -> PageOut:
     return PageOut(**service.get_page(conn, query_id, page_no, STATION))
+
+
+@app.get(
+    "/queries/{query_id}/audit",
+    response_model=QueryAuditOut,
+    tags=["queries"],
+    summary="Audit the original bins each frozen day used (stable verdicts)",
+    description=(
+        "For every frozen day, says which revision the snapshot adopted and "
+        "whether that revision's original bins continuously tile "
+        "(-inf, +inf). A verdict is recorded once and never recomputed, so "
+        "later corrections and restarts keep it. Days whose adopted revision "
+        "was overwritten before a verdict existed are reported as "
+        "``unverifiable``. Queries created by an older release are audited "
+        "lazily on first access."
+    ),
+)
+def get_query_audit(query_id: str, conn: Conn) -> QueryAuditOut:
+    return QueryAuditOut(**service.get_query_audit(conn, query_id, STATION))
 
 
 @app.get(

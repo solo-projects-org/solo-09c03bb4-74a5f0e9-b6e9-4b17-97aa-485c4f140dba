@@ -13,6 +13,10 @@ Scenarios
 3. Page through the frozen result, resuming page by page.
 4. Correct a day, show the old query still serves its frozen numbers and a
    new query picks up the correction.
+5. Anomalous historical bins (only if ``scripts/legacy_seed.py`` ran first):
+   a new query is refused with the dates and revisions, an old query still
+   pages and its audit names the anomaly or says the original bins are gone,
+   and after corrections a new query succeeds.
 """
 
 from __future__ import annotations
@@ -149,7 +153,90 @@ def main() -> int:
     )
     print(f"\n== new query {fresh['query_id'][:10]}... page ==")
     rows([d for d in page["days"] if d["available"]])
+
+    demo_anomalies()
     return 0
+
+
+def demo_anomalies() -> None:
+    """Show the anomalous-historical-bins flow when the seed data is present."""
+    status, seeded = call("GET", "/queries/q-legacy-anomaly")
+    if status == 404:
+        print(
+            "\n== anomalous historical bins: skipped =="
+            "\n  run `docker compose exec api python scripts/legacy_seed.py` first"
+        )
+        return
+
+    print("\n" + "=" * 72)
+    print("== anomalous historical bins ==")
+    show(
+        "old query q-legacy-anomaly: audit verdicts",
+        seeded.get("audit"),
+    )
+
+    # A new query over the seeded range is refused, and says why and which
+    # revision it saw.  No snapshot is created.
+    refused_request = {
+        "start_date": "2022-01-15",
+        "end_date": "2022-01-16",
+        "boundaries": [55, 65],
+    }
+    status, refused = call("POST", "/queries", refused_request)
+    print(f"\nPOST /queries over anomalous days -> {status} {refused['error']['code']}")
+    show(
+        "refusal: dates and revisions, no snapshot",
+        {
+            "anomalous_dates": refused["error"]["anomalous_dates"],
+            "anomalies": [
+                {"date": a["date"], "revision": a["revision"],
+                 "problems": [p["code"] + ":" + str(p.get("reason")) for p in a["problems"]]}
+                for a in refused["error"]["anomalies"]
+            ],
+        },
+    )
+
+    # The old queries keep paging under their original ids and show verdicts.
+    for qid, label in (
+        ("q-legacy-anomaly", "still-stored original bins -> anomalous"),
+        ("q-legacy-overwritten", "original bins overwritten -> unverifiable"),
+    ):
+        status, meta = call("GET", f"/queries/{qid}")
+        status, page = call("GET", f"/queries/{qid}/pages/1")
+        print(f"\n== old query {qid} ({label}) ==")
+        rows(page["days"])
+        day = page["days"][0]
+        print(
+            f"  bin_status={day['bin_status']} anomalous={day['anomalous']} "
+            f"revision={day['revision']}"
+        )
+        if meta["audit"]["unverifiable_days"]:
+            print(f"  note: {meta['audit']['unverifiable_days'][0]['note']}")
+
+    # Correct both anomalous days, then a new query succeeds.
+    corrected = minutes([(50, 300), (64, 300), (70, 840)])
+    for day_iso in ("2022-01-15", "2022-01-16"):
+        status, written = call(
+            "PUT",
+            f"/days/{day_iso}",
+            {"mode": "minutes", "values": corrected},
+        )
+        print(f"\nPUT {day_iso} correction: {status} rev={written.get('revision')}")
+    status, fresh = call("POST", "/queries", refused_request)
+    print(f"POST /queries after corrections -> {status}")
+    show(
+        "new query succeeds; old queries untouched",
+        {
+            "query_id": fresh["query_id"],
+            "effective_boundaries": fresh["effective_boundaries"],
+            "rejected": fresh["rejected"],
+        },
+    )
+    status, old_meta = call("GET", "/queries/q-legacy-anomaly")
+    show(
+        "old query verdicts after correction + restart-worth of reads",
+        old_meta["audit"],
+    )
 
 
 if __name__ == "__main__":

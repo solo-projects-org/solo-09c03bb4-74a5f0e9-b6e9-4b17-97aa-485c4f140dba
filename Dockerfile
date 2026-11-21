@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY scripts ./scripts
 
 # Numeric UID/GID avoids depending on useradd being present in the base image.
 RUN mkdir -p /data && chown -R 10001:10001 /data

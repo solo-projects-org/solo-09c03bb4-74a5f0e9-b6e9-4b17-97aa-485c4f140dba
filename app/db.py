@@ -19,7 +19,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS day (
@@ -82,6 +82,21 @@ CREATE TABLE IF NOT EXISTS query_page (
     page_no  INTEGER NOT NULL,
     dates    TEXT NOT NULL,                  -- JSON list[str]
     PRIMARY KEY (query_id, page_no)
+) WITHOUT ROWID;
+
+-- Verdict about the original bins each frozen query day used.  A verdict is
+-- written once, when the revision can still be checked, and is never
+-- recomputed.  That is what keeps it stable across later corrections and
+-- restarts.  ``status`` is 'valid' | 'anomalous' | 'unverifiable'.
+CREATE TABLE IF NOT EXISTS query_day_audit (
+    query_id   TEXT NOT NULL REFERENCES query_log(query_id) ON DELETE CASCADE,
+    date       TEXT NOT NULL,
+    revision   INTEGER NOT NULL,             -- revision adopted by the snapshot
+    source     TEXT NOT NULL,                -- 'bins' (only bins days are audited)
+    status     TEXT NOT NULL,
+    details    TEXT NOT NULL,                -- JSON object
+    audited_at TEXT NOT NULL,
+    PRIMARY KEY (query_id, date)
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS reading_day ON reading(day_id);

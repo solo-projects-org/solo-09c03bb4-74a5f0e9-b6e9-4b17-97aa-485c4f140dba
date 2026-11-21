@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
+import sqlite3
+
+from app import db
+
 from .conftest import minutes
 
 
@@ -9,10 +15,385 @@ def _bins(edges, counts):
     return {"mode": "bins", "boundaries": edges, "counts": counts}
 
 
+def _legacy_bins_day(date: str, revision: int, intervals: list[dict]) -> None:
+    """Insert a bins-day straight into storage, as the old release left it."""
+    conn = db.connect(os.environ["NOISE_DB"])
+    try:
+        with db.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO day (date, revision, source, created_at, updated_at)"
+                " VALUES (?, ?, 'bins', 'legacy', 'legacy')",
+                (date, revision),
+            )
+            day_id = int(cur.lastrowid)
+            conn.executemany(
+                "INSERT INTO bin_interval (day_id, idx, lower, upper, minutes)"
+                " VALUES (?, ?, ?, ?, ?)",
+                [
+                    (day_id, i, b["lower"], b["upper"], b["minutes"])
+                    for i, b in enumerate(intervals)
+                ],
+            )
+    finally:
+        conn.close()
+
+
+def _legacy_query(
+    query_id: str,
+    date: str,
+    revision: int,
+    source: str,
+    counts: list[int],
+    *,
+    boundaries: list[int] | None = None,
+    days_total: int = 1,
+    page_size: int = 31,
+) -> None:
+    """Freeze a query snapshot the way the old release did (no audit rows)."""
+    boundaries = boundaries or []
+    conn = db.connect(os.environ["NOISE_DB"])
+    try:
+        day_id = conn.execute(
+            "SELECT day_id FROM day WHERE date = ?", (date,)
+        ).fetchone()["day_id"]
+        definitions = [
+            {
+                "index": i,
+                "lower": boundaries[i - 1] if i else None,
+                "upper": boundaries[i] if i < len(boundaries) else None,
+                "label": "legacy",
+            }
+            for i in range(len(boundaries) + 1)
+        ]
+        with db.write_txn(conn):
+            conn.execute(
+                "INSERT INTO query_log (query_id, created_at, start_date, end_date,"
+                " requested_boundaries, ignored_duplicates, effective_boundaries,"
+                " bin_definitions, rejected, missing_dates, page_size, days_total,"
+                " pages_total) VALUES (?, 'legacy', ?, ?, ?, '[]', ?, ?, '[]', '[]',"
+                " ?, ?, 1)",
+                (
+                    query_id,
+                    date,
+                    date,
+                    json.dumps(boundaries),
+                    json.dumps(boundaries),
+                    json.dumps(definitions),
+                    page_size,
+                    days_total,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO query_day (query_id, date, day_id, revision, source,"
+                " counts, minutes_total) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (query_id, date, day_id, revision, source, json.dumps(counts), 1440),
+            )
+            conn.execute(
+                "INSERT INTO query_page (query_id, page_no, dates) VALUES (?, 1, ?)",
+                (query_id, json.dumps([date])),
+            )
+    finally:
+        conn.close()
+
+
 def test_health(client):
     body = client.get("/health").json()
     assert body["status"] == "ok"
     assert body["days_stored"] == 0
+
+
+def test_explicit_bins_with_unbounded_inner_edges_are_rejected(client):
+    response = client.put(
+        "/days/2024-01-01",
+        json={
+            "mode": "bins",
+            "intervals": [
+                {"lower": None, "upper": 55, "minutes": 100},
+                {"lower": None, "upper": None, "minutes": 500},
+                {"lower": 65, "upper": None, "minutes": 840},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "bins_not_contiguous"
+    assert error["problems"]
+    assert client.get("/days/2024-01-01").status_code == 404
+
+
+def test_overlapping_explicit_bins_are_rejected(client):
+    response = client.put(
+        "/days/2024-01-01",
+        json={
+            "mode": "bins",
+            "intervals": [
+                {"lower": None, "upper": 60, "minutes": 100},
+                {"lower": 55, "upper": 65, "minutes": 500},
+                {"lower": 65, "upper": None, "minutes": 840},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "bins_not_contiguous"
+    assert error["problems"][0]["reason"] == "overlap"
+
+
+def test_rejected_correction_keeps_the_stored_day_and_revision(client):
+    good = {"mode": "bins", "boundaries": [55, 65], "counts": [100, 500, 840]}
+    first = client.put("/days/2024-02-01", json=good).json()
+    assert first["revision"] == 1
+
+    for bad in (
+        {
+            "mode": "bins",
+            "intervals": [
+                {"lower": None, "upper": 55, "minutes": 100},
+                {"lower": 55, "upper": None, "minutes": 500},
+                {"lower": 65, "upper": None, "minutes": 840},
+            ],
+        },
+        {
+            "mode": "bins",
+            "intervals": [
+                {"lower": None, "upper": 55, "minutes": 100},
+                {"lower": 55, "upper": 70, "minutes": 500},
+                {"lower": 65, "upper": None, "minutes": 840},
+            ],
+        },
+        {"mode": "bins", "boundaries": [55, 65], "counts": [100, 500]},
+    ):
+        response = client.put("/days/2024-02-01", json=bad)
+        assert response.status_code == 422
+
+    stored = client.get("/days/2024-02-01").json()
+    assert stored["revision"] == 1
+    assert stored["intervals"] == [
+        {"lower": None, "upper": 55, "minutes": 100},
+        {"lower": 55, "upper": 65, "minutes": 500},
+        {"lower": 65, "upper": None, "minutes": 840},
+    ]
+
+
+def test_new_query_refuses_legacy_anomalous_day_without_a_snapshot(client):
+    _legacy_bins_day(
+        "2024-03-01",
+        7,
+        [
+            {"lower": None, "upper": 55, "minutes": 600},
+            {"lower": 70, "upper": None, "minutes": 840},
+        ],
+    )
+    response = client.post(
+        "/queries",
+        json={
+            "start_date": "2024-03-01",
+            "end_date": "2024-03-02",
+            "boundaries": [60],
+        },
+    )
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "anomalous_day_bins"
+    assert error["anomalous_dates"] == ["2024-03-01"]
+    assert error["anomalies"][0]["date"] == "2024-03-01"
+    assert error["anomalies"][0]["revision"] == 7
+    assert error["anomalies"][0]["problems"]
+
+    # No snapshot was frozen: querying for it fails, and nothing was logged.
+    conn = sqlite3.connect(os.environ["NOISE_DB"])
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM query_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM query_day").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # Corrections are still allowed and clear the anomaly for the next query.
+    fixed = client.put("/days/2024-03-01", json=_bins([55, 65], [600, 400, 440]))
+    assert fixed.status_code == 200
+    fresh = client.post(
+        "/queries",
+        json={
+            "start_date": "2024-03-01",
+            "end_date": "2024-03-01",
+            "boundaries": [60],
+        },
+    )
+    assert fresh.status_code == 201
+
+
+def test_old_query_still_pages_and_audit_names_the_anomaly(client):
+    # A snapshot frozen by the old release over a day whose bins leave a gap.
+    _legacy_bins_day(
+        "2024-04-01",
+        3,
+        [
+            {"lower": None, "upper": 55, "minutes": 600},
+            {"lower": 70, "upper": None, "minutes": 840},
+        ],
+    )
+    _legacy_query("q-legacy-anomalous", "2024-04-01", 3, "bins", [1440])
+
+    meta = client.get("/queries/q-legacy-anomalous").json()
+    assert meta["audit"]["anomalous_total"] == 1
+    anomaly = meta["audit"]["anomalous_days"][0]
+    assert anomaly["date"] == "2024-04-01"
+    assert anomaly["revision"] == 3
+    assert anomaly["status"] == "anomalous"
+    assert anomaly["original_bins"] == [
+        {"lower": None, "upper": 55, "minutes": 600},
+        {"lower": 70, "upper": None, "minutes": 840},
+    ]
+
+    # The day detail says which date/revision the verdict belongs to.
+    day = client.get("/queries/q-legacy-anomalous/days/2024-04-01").json()
+    assert day["audit"]["status"] == "anomalous"
+    assert day["audit"]["revision"] == 3
+    assert day["counts"] == [1440]
+
+    # The frozen page still serves the original bins and counts.
+    page = client.get("/queries/q-legacy-anomalous/pages/1").json()
+    assert page["days"][0]["counts"] == [1440]
+    assert page["days"][0]["revision"] == 3
+    assert page["days"][0]["bin_status"] == "anomalous"
+    assert page["days"][0]["anomalous"] is True
+
+
+def test_legacy_query_becomes_unverifiable_after_overwrite(client):
+    _legacy_bins_day(
+        "2024-05-01",
+        5,
+        [
+            {"lower": None, "upper": 55, "minutes": 600},
+            {"lower": 55, "upper": None, "minutes": 840},
+        ],
+    )
+    _legacy_query("q-legacy-overwritten", "2024-05-01", 5, "bins", [1440])
+    # The reviewer corrects the day before ever opening the old query.
+    client.put("/days/2024-05-01", json={"mode": "minutes", "values": minutes(l50=1440)})
+
+    meta = client.get("/queries/q-legacy-overwritten").json()
+    assert meta["audit"]["unverifiable_total"] == 1
+    assert meta["audit"]["anomalous_total"] == 0
+    entry = meta["audit"]["unverifiable_days"][0]
+    assert entry["date"] == "2024-05-01"
+    assert entry["revision"] == 5
+    assert entry["status"] == "unverifiable"
+    assert "no longer stored" in entry["note"]
+
+    # Still frozen and still pageable under the original query id.
+    page = client.get("/queries/q-legacy-overwritten/pages/1").json()
+    assert page["days"][0]["revision"] == 5
+    assert page["days"][0]["counts"] == [1440]
+    assert page["days"][0]["bin_status"] == "unverifiable"
+
+
+def test_verdict_survives_correction_and_restart(client):
+    client.put("/days/2024-06-01", json=_bins([55], [600, 840]))
+    created = client.post(
+        "/queries",
+        json={
+            "start_date": "2024-06-01",
+            "end_date": "2024-06-01",
+            "boundaries": [55],
+        },
+    ).json()
+    qid = created["query_id"]
+    before = client.get(f"/queries/{qid}/audit").json()
+    assert before["valid_total"] == 1
+    assert before["days"][0]["status"] == "valid"
+    assert before["days"][0]["revision"] == 1
+
+    client.put("/days/2024-06-01", json={"mode": "minutes", "values": minutes(l50=1440)})
+
+    from fastapi.testclient import TestClient
+
+    import app.main as main_module
+
+    with TestClient(main_module.app) as restarted:
+        after = restarted.get(f"/queries/{qid}/audit").json()
+        day = restarted.get(f"/queries/{qid}/days/2024-06-01").json()
+        page = restarted.get(f"/queries/{qid}/pages/1").json()
+    assert after == before  # verdict preserved byte-for-byte
+    assert day["audit"] == before["days"][0]
+    assert page["days"][0]["revision"] == 1
+    assert page["days"][0]["bin_status"] == "valid"
+
+
+def test_legacy_contiguous_day_is_audited_valid_and_stays_valid(client):
+    _legacy_bins_day(
+        "2024-07-01",
+        4,
+        [
+            {"lower": None, "upper": 55, "minutes": 600},
+            {"lower": 55, "upper": None, "minutes": 840},
+        ],
+    )
+    _legacy_query(
+        "q-legacy-valid", "2024-07-01", 4, "bins", [600, 840], boundaries=[55]
+    )
+
+    first = client.get("/queries/q-legacy-valid/audit").json()
+    assert first["valid_total"] == 1
+    assert first["days"][0]["status"] == "valid"
+    assert first["days"][0]["revision"] == 4
+    assert first["days"][0]["original_bins"] == [
+        {"lower": None, "upper": 55, "minutes": 600},
+        {"lower": 55, "upper": None, "minutes": 840},
+    ]
+
+    # Correcting the day afterwards must not erase the recorded judgement.
+    client.put("/days/2024-07-01", json={"mode": "minutes", "values": minutes(l40=1440)})
+    second = client.get("/queries/q-legacy-valid/audit").json()
+    assert second == first
+    day = client.get("/queries/q-legacy-valid/days/2024-07-01").json()
+    assert day["counts"] == [600, 840]  # frozen snapshot unchanged
+    assert day["revision"] == 4
+    assert day["bin_status"] == "valid"
+    assert day["original_bins"] == first["days"][0]["original_bins"]
+
+
+def test_refusal_lists_every_anomalous_day_and_only_those(client):
+    _legacy_bins_day(
+        "2024-08-01",
+        2,
+        [
+            {"lower": None, "upper": None, "minutes": 700},
+            {"lower": None, "upper": None, "minutes": 740},
+        ],
+    )
+    # A valid contiguous legacy day in the same range must not be reported.
+    _legacy_bins_day(
+        "2024-08-02",
+        1,
+        [
+            {"lower": None, "upper": 55, "minutes": 600},
+            {"lower": 55, "upper": None, "minutes": 840},
+        ],
+    )
+    _legacy_bins_day(
+        "2024-08-03",
+        9,
+        [
+            {"lower": None, "upper": 55, "minutes": 600},
+            {"lower": 70, "upper": None, "minutes": 840},
+        ],
+    )
+    response = client.post(
+        "/queries",
+        json={
+            "start_date": "2024-08-01",
+            "end_date": "2024-08-03",
+            "boundaries": [55, 65],
+        },
+    )
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["anomalous_dates"] == ["2024-08-01", "2024-08-03"]
+    assert [(a["date"], a["revision"]) for a in error["anomalies"]] == [
+        ("2024-08-01", 2),
+        ("2024-08-03", 9),
+    ]
 
 
 def test_write_and_read_minutes_day(client):

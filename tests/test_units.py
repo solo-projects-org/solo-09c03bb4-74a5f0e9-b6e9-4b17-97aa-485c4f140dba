@@ -125,6 +125,74 @@ def test_invalid_bins_are_rejected(doc):
     assert info.value.status == 422
 
 
+@pytest.mark.parametrize(
+    "doc, code",
+    [
+        # an inner bin unbounded on both ends: it swallows the line and the
+        # neighbours overlap it
+        (
+            [
+                service.Interval(None, None, 700),
+                service.Interval(None, None, 740),
+            ],
+            "bins_not_contiguous",
+        ),
+        # an inner bin open at the bottom only
+        (
+            [
+                service.Interval(None, 55, 100),
+                service.Interval(None, 65, 500),
+                service.Interval(65, None, 840),
+            ],
+            "bins_not_contiguous",
+        ),
+        # an inner bin open at the top only
+        (
+            [
+                service.Interval(None, 55, 100),
+                service.Interval(55, None, 500),
+                service.Interval(65, None, 840),
+            ],
+            "bins_not_contiguous",
+        ),
+        # explicit overlap: bin 1 starts below bin 0's end
+        (
+            [
+                service.Interval(None, 60, 100),
+                service.Interval(55, 65, 500),
+                service.Interval(65, None, 840),
+            ],
+            "bins_not_contiguous",
+        ),
+        # explicit gap: bin 1 starts above bin 0's end
+        (
+            [
+                service.Interval(None, 55, 100),
+                service.Interval(60, 65, 500),
+                service.Interval(65, None, 840),
+            ],
+            "bins_not_contiguous",
+        ),
+    ],
+)
+def test_bins_must_tile_the_whole_line(doc, code):
+    with pytest.raises(service.ServiceError) as info:
+        service.normalize_intervals(doc)
+    assert info.value.code == code
+    assert info.value.details["problems"]
+
+
+def test_interval_problems_accepts_a_contiguous_zero_width_free_tiling():
+    doc = [
+        service.Interval(None, 40, 0),
+        service.Interval(40, 55, 100),
+        service.Interval(55, 65, 0),
+        service.Interval(65, 90, 500),
+        service.Interval(90, None, 840),
+    ]
+    assert service.interval_problems(doc) == []
+
+
 def test_minutes_need_exactly_1440_ints():
     with pytest.raises(service.ServiceError) as info:
         service.normalize_minutes([1, 2, 3])

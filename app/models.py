@@ -117,6 +117,18 @@ DaySubmission = Annotated[
 # ---------------------------------------------------------------------------
 
 
+class BinProblemOut(BaseModel):
+    code: str
+    message: str
+    bin: int | None = None
+    reason: str | None = None
+    lower: int | None = None
+    upper: int | None = None
+    previous_upper: int | None = None
+    expected: int | None = None
+    got: int | None = None
+
+
 class BinIntervalOut(BaseModel):
     lower: int | None
     upper: int | None
@@ -233,10 +245,6 @@ class PageIndexOut(BaseModel):
     dates: list[str]
 
 
-class QueryOut(QuerySummaryOut):
-    pages: list[PageIndexOut]
-
-
 class PageDayOut(BaseModel):
     date: str
     available: bool
@@ -244,6 +252,11 @@ class PageDayOut(BaseModel):
     source: Literal["minutes", "bins"] | None
     counts: list[int] | None
     minutes_total: int | None
+    bin_status: Literal["valid", "anomalous", "unverifiable", "not_applicable"] = (
+        "not_applicable"
+    )
+    anomalous: bool = False
+    original_bins: list[BinIntervalOut] | None = None
 
 
 class PageOut(BaseModel):
@@ -258,6 +271,72 @@ class PageOut(BaseModel):
     days: list[PageDayOut]
 
 
+class QueryDayAuditOut(BaseModel):
+    """Which revision of which day the snapshot used, and the stored verdict.
+
+    ``status``:
+      * ``valid``        — the adopted revision was checked and its bins tile
+                           the line; the verdict is kept forever.
+      * ``anomalous``    — the adopted revision was checked and is broken.
+                           Only possible for queries frozen with an older
+                           release; new queries refuse such days.
+      * ``unverifiable`` — the adopted original bins are gone (a correction
+                           overwrote them before a verdict was recorded), so
+                           nothing about them can be re-checked.
+      * ``not_applicable`` — a minutes-submitted day; no original bins exist
+                           and every edge is computable exactly.
+    """
+
+    date: str
+    revision: int
+    source: Literal["minutes", "bins"]
+    status: Literal["valid", "anomalous", "unverifiable", "not_applicable"]
+    problems: list[BinProblemOut]
+    original_bins: list[BinIntervalOut] | None
+    audited_at: str | None
+    note: str | None = None
+
+
+class QueryAuditDayOut(BaseModel):
+    date: str
+    revision: int
+    source: Literal["minutes", "bins"]
+    status: Literal["valid", "anomalous", "unverifiable", "not_applicable"]
+    problems: list[BinProblemOut]
+    original_bins: list[BinIntervalOut] | None
+    audited_at: str
+    note: str | None = None
+
+
+class QueryAuditSummaryOut(BaseModel):
+    days_total: int
+    valid_total: int
+    anomalous_total: int
+    unverifiable_total: int
+    anomalous_days: list[QueryAuditDayOut]
+    unverifiable_days: list[QueryAuditDayOut]
+
+
+class QueryOut(QuerySummaryOut):
+    pages: list[PageIndexOut]
+    audit: QueryAuditSummaryOut
+
+
+class QueryAuditOut(BaseModel):
+    station: str
+    query_id: str
+    created_at: str
+    start_date: str
+    end_date: str
+    days_total: int
+    valid_total: int
+    anomalous_total: int
+    unverifiable_total: int
+    anomalous_days: list[QueryAuditDayOut]
+    unverifiable_days: list[QueryAuditDayOut]
+    days: list[QueryAuditDayOut]
+
+
 class QueryDayOut(BaseModel):
     station: str
     query_id: str
@@ -269,6 +348,10 @@ class QueryDayOut(BaseModel):
     minutes_total: int
     effective_boundaries: list[int]
     bins: list[BinOut]
+    bin_status: Literal["valid", "anomalous", "unverifiable", "not_applicable"]
+    anomalous: bool
+    original_bins: list[BinIntervalOut] | None
+    audit: QueryDayAuditOut | None
 
 
 class HealthOut(BaseModel):

@@ -39,6 +39,13 @@ MAX_LEVEL = 300
 MIN_BOUNDARY = -1000
 MAX_BOUNDARY = 1000
 SEVERED_LIST_LIMIT = 50
+ANOMALY_LIST_LIMIT = 50
+
+# Values of ``query_day_audit.status``.
+AUDIT_VALID = "valid"
+AUDIT_ANOMALOUS = "anomalous"
+AUDIT_UNVERIFIABLE = "unverifiable"
+AUDIT_NOT_APPLICABLE = "not_applicable"
 
 
 class ServiceError(Exception):
@@ -87,6 +94,106 @@ class Interval:
         above_lower = self.lower is None or self.lower < boundary
         below_upper = self.upper is None or self.upper > boundary
         return above_lower and below_upper
+
+
+def interval_problems(intervals: Iterable[Interval]) -> list[dict[str, Any]]:
+    """Structural defects that stop bins from tiling ``(-inf, +inf)``.
+
+    A day's original bins must be contiguous and pairwise disjoint: the first
+    bin alone is open at the bottom, the last alone is open at the top, every
+    inner bin is bounded on both sides, and each bin begins exactly where the
+    previous one ended.  The check is structural: zero-minute bins still have
+    to be placed correctly.
+
+    Each problem is a JSON-friendly dict.  The same helper validates new
+    submissions and audits bins that were stored before the rule existed.
+    """
+    items = list(intervals)
+    if not items:
+        return [{"code": "no_bins", "message": "at least one bin is required"}]
+
+    problems: list[dict[str, Any]] = []
+    last = len(items) - 1
+    for i, item in enumerate(items):
+        if item.lower is not None and item.upper is not None and item.lower >= item.upper:
+            problems.append(
+                {
+                    "code": "invalid_bin_range",
+                    "bin": i,
+                    "message": f"bin {i} lower must be below upper",
+                    "lower": item.lower,
+                    "upper": item.upper,
+                }
+            )
+        if i == 0 and item.lower is not None:
+            problems.append(
+                {
+                    "code": "bins_do_not_cover_day",
+                    "bin": i,
+                    "message": "the first bin must be open at the bottom (lower = null)",
+                    "lower": item.lower,
+                }
+            )
+        if i > 0 and item.lower is None:
+            problems.append(
+                {
+                    "code": "bins_not_contiguous",
+                    "bin": i,
+                    "reason": "unbounded_inner_bin",
+                    "message": (
+                        f"bin {i} must be bounded at the bottom; only the first "
+                        "bin may be open at the bottom"
+                    ),
+                    "lower": None,
+                }
+            )
+        if i < last and item.upper is None:
+            problems.append(
+                {
+                    "code": "bins_not_contiguous",
+                    "bin": i,
+                    "reason": "unbounded_inner_bin",
+                    "message": (
+                        f"bin {i} must be bounded at the top; only the last "
+                        "bin may be open at the top"
+                    ),
+                    "upper": None,
+                }
+            )
+        if i == last and item.upper is not None:
+            problems.append(
+                {
+                    "code": "bins_do_not_cover_day",
+                    "bin": i,
+                    "message": "the last bin must be open at the top (upper = null)",
+                    "upper": item.upper,
+                }
+            )
+
+    for i in range(1, len(items)):
+        previous_upper = items[i - 1].upper
+        lower = items[i].lower
+        if lower == previous_upper:
+            continue
+        # None == None is reported above as an unbounded inner bin; here only
+        # a genuine gap or overlap needs a second problem entry.
+        if lower is None or previous_upper is None:
+            continue
+        overlap = lower < previous_upper
+        problems.append(
+            {
+                "code": "bins_not_contiguous",
+                "bin": i,
+                "reason": "overlap" if overlap else "gap",
+                "message": (
+                    f"bin {i} must start exactly where bin {i - 1} ends"
+                    + ("; the bins overlap" if overlap else "; the bins leave a gap")
+                ),
+                "previous_upper": previous_upper,
+                "lower": lower,
+            }
+        )
+    return problems
 
 
 @dataclass(frozen=True)
@@ -162,33 +269,20 @@ def normalize_intervals(intervals: Iterable[Interval]) -> NormalizedDay:
             _check_boundary(item.lower, f"bin {i} lower")
         if item.upper is not None:
             _check_boundary(item.upper, f"bin {i} upper")
-        if item.lower is not None and item.upper is not None and item.lower >= item.upper:
-            raise ServiceError(
-                422, "invalid_bin_range", f"bin {i} lower must be below upper", bin=i
-            )
         total += item.minutes
 
-    if items[0].lower is not None:
+    # Every inner bin must inherit both edges: an explicit ``null`` inside the
+    # list would otherwise make a bin unbounded and leave a hole in the day.
+    problems = interval_problems(items)
+    if problems:
+        first = problems[0]
         raise ServiceError(
             422,
-            "bins_do_not_cover_day",
-            "the first bin must be open at the bottom (lower = null)",
+            first["code"],
+            first["message"],
+            bin=first.get("bin"),
+            problems=problems,
         )
-    if items[-1].upper is not None:
-        raise ServiceError(
-            422,
-            "bins_do_not_cover_day",
-            "the last bin must be open at the top (upper = null)",
-        )
-    for i in range(1, len(items)):
-        if items[i].lower != items[i - 1].upper:
-            raise ServiceError(
-                422,
-                "bins_not_contiguous",
-                f"bin {i} must start exactly where bin {i - 1} ends",
-                previous_upper=items[i - 1].upper,
-                lower=items[i].lower,
-            )
     if total != MINUTES_PER_DAY:
         raise ServiceError(
             422,
@@ -234,6 +328,21 @@ def intervals_from_boundaries(boundaries: list[int], counts: list[int]) -> list[
 
 def upsert_day(conn: sqlite3.Connection, day: date, norm: NormalizedDay) -> dict:
     """Replace the whole day atomically and bump its revision."""
+    if norm.source == "bins":
+        # ``normalize_intervals`` already enforces this; checking again means a
+        # direct service caller cannot smuggle in a day that does not tile the
+        # line.  It runs before ``write_txn``, so a rejection leaves both the
+        # stored day and its revision untouched.
+        problems = interval_problems(norm.intervals or ())
+        if problems:
+            first = problems[0]
+            raise ServiceError(
+                422,
+                first["code"],
+                first["message"],
+                bin=first.get("bin"),
+                problems=problems,
+            )
     day_iso = iso(day)
     now = utcnow()
     with write_txn(conn):
@@ -367,6 +476,200 @@ def bin_definitions(boundaries: list[int]) -> list[dict]:
             label = f"[{lower},{upper})"
         defs.append({"index": i, "lower": lower, "upper": upper, "label": label})
     return defs
+
+
+def day_bin_problems(intervals: Iterable[Interval]) -> list[dict[str, Any]]:
+    """Anomalies of a stored bins-day: shape plus the 1440-minute total.
+
+    A day's bins must tile the whole line exactly once, and a day still has to
+    carry 1440 minutes.  Days written before the contiguity rule was tightened
+    may fail either check; this is the same audit used for new queries and for
+    frozen queries that predate the fix.
+    """
+    items = list(intervals)
+    problems = interval_problems(items)
+    total = sum(item.minutes for item in items)
+    if not problems and total != MINUTES_PER_DAY:
+        problems.append(
+            {
+                "code": "bin_total_mismatch",
+                "message": f"bin minutes must sum to {MINUTES_PER_DAY}, got {total}",
+                "expected": MINUTES_PER_DAY,
+                "got": total,
+            }
+        )
+    return problems
+
+
+def _audit_details(
+    *,
+    problems: Iterable[dict[str, Any]] = (),
+    original_bins: Iterable[Interval] | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "problems": list(problems),
+        "original_bins": (
+            None if original_bins is None else [b.to_json() for b in original_bins]
+        ),
+        "note": note,
+    }
+
+
+def _record_audit(
+    conn: sqlite3.Connection,
+    query_id: str,
+    date_iso: str,
+    revision: int,
+    source: str,
+    status: str,
+    details: dict[str, Any],
+    audited_at: str,
+) -> None:
+    """Write a verdict once; an existing verdict is never replaced."""
+    conn.execute(
+        "INSERT OR IGNORE INTO query_day_audit"
+        " (query_id, date, revision, source, status, details, audited_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            query_id,
+            date_iso,
+            revision,
+            source,
+            status,
+            json.dumps(details, sort_keys=True),
+            audited_at,
+        ),
+    )
+
+
+def _materialize_query_audits(conn: sqlite3.Connection, query_id: str) -> None:
+    """Record verdicts for frozen days that do not have one yet.
+
+    Queries frozen by a previous release have no verdict rows.  Such a query
+    can still be audited as long as the day it adopted is *still* stored at the
+    same revision; the verdict is then written and never recomputed, so a later
+    correction or a restart cannot rewrite history.  Once the day has moved on
+    (or was replaced by a minutes submission), the adopted original bins are
+    gone and the day is permanently recorded as ``unverifiable``.
+    """
+    pending_query = (
+        "SELECT qd.date, qd.revision, qd.source, d.day_id AS current_day_id,"
+        " d.revision AS current_revision, d.source AS current_source"
+        " FROM query_day AS qd"
+        " LEFT JOIN day AS d ON d.date = qd.date"
+        " LEFT JOIN query_day_audit AS a"
+        "   ON a.query_id = qd.query_id AND a.date = qd.date"
+        " WHERE qd.query_id = ? AND a.query_id IS NULL"
+        " ORDER BY qd.date"
+    )
+    with read_txn(conn):
+        if not conn.execute(pending_query, (query_id,)).fetchall():
+            return
+    with write_txn(conn):
+        pending = conn.execute(pending_query, (query_id,)).fetchall()
+        if not pending:
+            return
+        now = utcnow()
+        for row in pending:
+            revision = int(row["revision"])
+            source = row["source"]
+            if source == "minutes":
+                # There are no original bins to verify: every edge is
+                # computable from the full-resolution readings.  This holds
+                # regardless of whether the readings are still stored.
+                _record_audit(
+                    conn,
+                    query_id,
+                    row["date"],
+                    revision,
+                    source,
+                    AUDIT_NOT_APPLICABLE,
+                    _audit_details(),
+                    now,
+                )
+                continue
+            same_revision = (
+                row["current_revision"] is not None
+                and int(row["current_revision"]) == revision
+                and row["current_source"] == source
+            )
+            if not same_revision:
+                _record_audit(
+                    conn,
+                    query_id,
+                    row["date"],
+                    revision,
+                    source,
+                    AUDIT_UNVERIFIABLE,
+                    _audit_details(
+                        note=(
+                            f"revision {revision} of {row['date']} is no longer "
+                            "stored, so its original bins cannot be checked; "
+                            "the snapshot is still served unchanged"
+                        )
+                    ),
+                    now,
+                )
+                continue
+            intervals = _load_intervals(conn, int(row["current_day_id"]))
+            problems = day_bin_problems(intervals)
+            _record_audit(
+                conn,
+                query_id,
+                row["date"],
+                revision,
+                source,
+                AUDIT_ANOMALOUS if problems else AUDIT_VALID,
+                _audit_details(problems=problems, original_bins=intervals),
+                now,
+            )
+
+
+def audit_pending_queries(conn: sqlite3.Connection) -> int:
+    """Settle every verdict still missing, once, at startup.
+
+    The database may hold snapshots frozen by a previous release.  Right after
+    the upgrade the adopted revisions may still be stored, so this is the last
+    reliable moment to check them.  A day already overwritten is recorded as
+    ``unverifiable``; a day still at the adopted revision is recorded as
+    ``valid`` or ``anomalous`` and that verdict is never recomputed.  Later
+    corrections and restarts therefore cannot change it.
+    """
+    query_ids = [
+        row["query_id"]
+        for row in conn.execute(
+            "SELECT DISTINCT qd.query_id FROM query_day AS qd"
+            " LEFT JOIN query_day_audit AS a"
+            "   ON a.query_id = qd.query_id AND a.date = qd.date"
+            " WHERE a.query_id IS NULL"
+            " ORDER BY qd.query_id"
+        )
+    ]
+    for query_id in query_ids:
+        _materialize_query_audits(conn, query_id)
+    return len(query_ids)
+
+
+def _load_audits(conn: sqlite3.Connection, query_id: str) -> dict[str, dict[str, Any]]:
+    audits: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT date, revision, source, status, details, audited_at"
+        " FROM query_day_audit WHERE query_id = ? ORDER BY date",
+        (query_id,),
+    ):
+        details = json.loads(row["details"])
+        audits[row["date"]] = {
+            "date": row["date"],
+            "revision": int(row["revision"]),
+            "source": row["source"],
+            "status": row["status"],
+            "problems": details.get("problems") or [],
+            "original_bins": details.get("original_bins"),
+            "note": details.get("note"),
+            "audited_at": row["audited_at"],
+        }
+    return audits
 
 
 def counts_from_minutes(values: Iterable[int], boundaries: list[int]) -> list[int]:
@@ -525,6 +828,66 @@ def create_query(
         days, bins_days = _snapshot_rows(conn, start, end)
         available = {row["date"] for row, _, _ in days}
 
+        # A stored bins-day may predate the contiguity rule.  Refuse to freeze
+        # a snapshot from such a day: its counts would silently be ambiguous.
+        # Nothing is inserted (the exception rolls the transaction back), and
+        # the caller gets every offending date with the revision it read.
+        anomalies = []
+        audit_rows: list[tuple[str, str, int, str, str, str, str]] = []
+        for row, _, intervals in days:
+            if row["source"] == "bins":
+                problems = day_bin_problems(intervals or [])
+                if problems:
+                    anomalies.append(
+                        {
+                            "date": row["date"],
+                            "revision": int(row["revision"]),
+                            "source": "bins",
+                            "problems": problems,
+                            "original_bins": [b.to_json() for b in intervals or []],
+                        }
+                    )
+                    continue
+                audit_rows.append(
+                    (
+                        query_id,
+                        row["date"],
+                        int(row["revision"]),
+                        "bins",
+                        AUDIT_VALID,
+                        json.dumps(
+                            _audit_details(original_bins=intervals or []),
+                            sort_keys=True,
+                        ),
+                        created_at,
+                    )
+                )
+            else:
+                audit_rows.append(
+                    (
+                        query_id,
+                        row["date"],
+                        int(row["revision"]),
+                        "minutes",
+                        AUDIT_NOT_APPLICABLE,
+                        json.dumps(_audit_details(), sort_keys=True),
+                        created_at,
+                    )
+                )
+        if anomalies:
+            raise ServiceError(
+                409,
+                "anomalous_day_bins",
+                (
+                    f"{len(anomalies)} stored day(s) in range have bins that do "
+                    "not continuously tile (-inf, +inf); no query was created"
+                ),
+                anomalies=anomalies,
+                anomalous_days=anomalies,
+                anomalous_dates=[item["date"] for item in anomalies],
+                anomalies_total=len(anomalies),
+            )
+
         effective, rejected = _reject_candidates(requested, bins_days)
         effective = sorted(effective)
         definitions = bin_definitions(effective)
@@ -584,6 +947,11 @@ def create_query(
             "INSERT INTO query_page (query_id, page_no, dates) VALUES (?, ?, ?)",
             [(query_id, i + 1, json.dumps(dates)) for i, dates in enumerate(pages)],
         )
+        conn.executemany(
+            "INSERT INTO query_day_audit (query_id, date, revision, source, status,"
+            " details, audited_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            audit_rows,
+        )
 
     return {
         "station": station,
@@ -638,6 +1006,9 @@ def _query_meta(row: sqlite3.Row, station: str) -> dict:
 
 def get_query(conn: sqlite3.Connection, query_id: str, station: str) -> dict:
     with read_txn(conn):
+        _load_query_row(conn, query_id)
+    _materialize_query_audits(conn, query_id)
+    with read_txn(conn):
         row = _load_query_row(conn, query_id)
         meta = _query_meta(row, station)
         meta["pages"] = [
@@ -648,10 +1019,83 @@ def get_query(conn: sqlite3.Connection, query_id: str, station: str) -> dict:
                 (query_id,),
             )
         ]
+        audits = list(_load_audits(conn, query_id).values())
+        anomalous_days = [
+            _audit_day_payload(a) for a in audits if a["status"] == AUDIT_ANOMALOUS
+        ]
+        unverifiable_days = [
+            _audit_day_payload(a) for a in audits if a["status"] == AUDIT_UNVERIFIABLE
+        ]
+        meta["audit"] = {
+            "days_total": len(audits),
+            "valid_total": sum(1 for a in audits if a["status"] == AUDIT_VALID),
+            "anomalous_total": len(anomalous_days),
+            "unverifiable_total": len(unverifiable_days),
+            "anomalous_days": anomalous_days,
+            "unverifiable_days": unverifiable_days,
+        }
         return meta
 
 
+def _audit_day_payload(audit: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": audit["date"],
+        "revision": audit["revision"],
+        "source": audit["source"],
+        "status": audit["status"],
+        "problems": audit["problems"],
+        "original_bins": audit["original_bins"],
+        "audited_at": audit["audited_at"],
+        "note": audit["note"],
+    }
+
+
+def get_query_audit(conn: sqlite3.Connection, query_id: str, station: str) -> dict:
+    """Verdicts for every frozen day: which revision, checked when.
+
+    Materialises any verdict still missing first (older queries), then reads
+    the stored verdicts.  A verdict that already exists is never recomputed,
+    so later corrections and restarts keep the original judgement.
+    """
+    with read_txn(conn):
+        _load_query_row(conn, query_id)
+    _materialize_query_audits(conn, query_id)
+    with read_txn(conn):
+        row = _load_query_row(conn, query_id)
+        audits = _load_audits(conn, query_id)
+        days = []
+        counts = {AUDIT_VALID: 0, AUDIT_ANOMALOUS: 0, AUDIT_UNVERIFIABLE: 0}
+        anomalous_days = []
+        unverifiable_days = []
+        for audit in audits.values():
+            day = _audit_day_payload(audit)
+            if audit["status"] in counts:
+                counts[audit["status"]] += 1
+            if audit["status"] == AUDIT_ANOMALOUS:
+                anomalous_days.append(day)
+            elif audit["status"] == AUDIT_UNVERIFIABLE:
+                unverifiable_days.append(day)
+            days.append(day)
+        return {
+            "station": station,
+            "query_id": query_id,
+            "created_at": row["created_at"],
+            "start_date": row["start_date"],
+            "end_date": row["end_date"],
+            "days_total": len(days),
+            "valid_total": counts[AUDIT_VALID],
+            "anomalous_total": counts[AUDIT_ANOMALOUS],
+            "unverifiable_total": counts[AUDIT_UNVERIFIABLE],
+            "anomalous_days": anomalous_days,
+            "unverifiable_days": unverifiable_days,
+            "days": days,
+        }
+
+
 def get_page(conn: sqlite3.Connection, query_id: str, page_no: int, station: str) -> dict:
+    with read_txn(conn):
+        _load_query_row(conn, query_id)
+    _materialize_query_audits(conn, query_id)
     with read_txn(conn):
         row = _load_query_row(conn, query_id)
         page_row = conn.execute(
@@ -677,6 +1121,7 @@ def get_page(conn: sqlite3.Connection, query_id: str, page_no: int, station: str
                 (query_id, *dates),
             )
         }
+        audits = _load_audits(conn, query_id)
         days = []
         for day_iso in dates:
             day = stored.get(day_iso)
@@ -689,9 +1134,14 @@ def get_page(conn: sqlite3.Connection, query_id: str, page_no: int, station: str
                         "source": None,
                         "counts": None,
                         "minutes_total": None,
+                        "bin_status": AUDIT_NOT_APPLICABLE,
+                        "anomalous": False,
+                        "original_bins": None,
                     }
                 )
             else:
+                audit = audits.get(day_iso)
+                bin_status = audit["status"] if audit else AUDIT_UNVERIFIABLE
                 days.append(
                     {
                         "date": day_iso,
@@ -700,6 +1150,9 @@ def get_page(conn: sqlite3.Connection, query_id: str, page_no: int, station: str
                         "source": day["source"],
                         "counts": json.loads(day["counts"]),
                         "minutes_total": int(day["minutes_total"]),
+                        "bin_status": bin_status,
+                        "anomalous": bin_status == AUDIT_ANOMALOUS,
+                        "original_bins": audit["original_bins"] if audit else None,
                     }
                 )
         return {
@@ -718,6 +1171,9 @@ def get_page(conn: sqlite3.Connection, query_id: str, page_no: int, station: str
 def get_query_day(
     conn: sqlite3.Connection, query_id: str, day: date, station: str
 ) -> dict:
+    with read_txn(conn):
+        _load_query_row(conn, query_id)
+    _materialize_query_audits(conn, query_id)
     with read_txn(conn):
         row = _load_query_row(conn, query_id)
         day_iso = iso(day)
@@ -742,6 +1198,8 @@ def get_query_day(
                 query_id=query_id,
                 date=day_iso,
             )
+        audit = _load_audits(conn, query_id).get(day_iso)
+        bin_status = audit["status"] if audit else AUDIT_UNVERIFIABLE
         return {
             "station": station,
             "query_id": query_id,
@@ -753,4 +1211,8 @@ def get_query_day(
             "minutes_total": int(stored["minutes_total"]),
             "effective_boundaries": json.loads(row["effective_boundaries"]),
             "bins": json.loads(row["bin_definitions"]),
+            "bin_status": bin_status,
+            "anomalous": bin_status == AUDIT_ANOMALOUS,
+            "original_bins": audit["original_bins"] if audit else None,
+            "audit": audit,
         }

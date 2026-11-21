@@ -3,7 +3,7 @@ name: road-noise
 services:
   api:
     build: .
-    image: road-noise-api:1.0.0
+    image: road-noise-api:1.1.0
     container_name: road-noise-api
     environment:
       NOISE_DB: /data/noise.db
